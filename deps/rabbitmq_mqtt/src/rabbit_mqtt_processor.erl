@@ -82,6 +82,7 @@
          %% (Not to be confused with packet IDs sent from client to server which can be the
          %% same IDs because client and server assign IDs independently of each other.)
          packet_id = 1 :: packet_id(),
+         publish_packet_qos = undefined,
          subscriptions = #{} :: #{Topic :: binary() => QoS :: ?QOS_0..?QOS_1},
          auth_state = #auth_state{},
          ra_register_state :: option(registered | {pending, reference()}),
@@ -258,7 +259,9 @@ process_request(?PUBLISH,
                                 cfg = #cfg{proto_ver = ProtoVer}}) ->
     EffectiveQos = maybe_downgrade_qos(Qos),
     rabbit_global_counters:messages_received(ProtoVer, 1),
-    State = maybe_increment_publisher(State0),
+    State1 = maybe_increment_publisher(State0),
+    %% Set QoS to know what the response package type must be
+    State = State1#state{publish_packet_qos = Qos},
     Msg = #mqtt_msg{retain     = Retain,
                     qos        = EffectiveQos,
                     topic      = Topic,
@@ -280,6 +283,14 @@ process_request(?PUBLISH,
                     {ok, State}
             end
     end;
+
+process_request(?PUBREL,
+                #mqtt_packet{variable = #mqtt_packet_publish{packet_id = PacketId}},
+                State) ->
+    Packet = #mqtt_packet{fixed = #mqtt_packet_fixed{type = ?PUBCOMP},
+                          variable = #mqtt_packet_publish{packet_id = PacketId}},
+    send(Packet, State),
+    {ok, State};
 
 process_request(?SUBSCRIBE,
                 #mqtt_packet{
@@ -1147,12 +1158,18 @@ process_routing_confirm(#delivery{confirm = true,
     State;
 process_routing_confirm(#delivery{confirm = true,
                                   msg_seq_no = PktId},
-                        [], State = #state{cfg = #cfg{proto_ver = ProtoVer}}) ->
+                        [], State = #state{publish_packet_qos = QoS,
+                                           cfg = #cfg{proto_ver = ProtoVer}}) ->
     rabbit_global_counters:messages_unroutable_returned(ProtoVer, 1),
     %% MQTT 5 spec:
     %% If the Server knows that there are no matching subscribers, it MAY use
     %% Reason Code 0x10 (No matching subscribers) instead of 0x00 (Success).
-    send_puback(PktId, State),
+    case QoS of
+        ?QOS_1 ->
+        send_puback(PktId, State);
+        ?QOS_2 ->
+        send_pubrec(PktId, State)
+    end,
     State;
 process_routing_confirm(#delivery{confirm = false}, _, State) ->
     State;
@@ -1183,6 +1200,25 @@ send_puback(PktIds0, State)
 send_puback(PktId, State = #state{cfg = #cfg{proto_ver = ProtoVer}}) ->
     rabbit_global_counters:messages_confirmed(ProtoVer, 1),
     Packet = #mqtt_packet{fixed = #mqtt_packet_fixed{type = ?PUBACK},
+                          variable = #mqtt_packet_publish{packet_id = PktId}},
+    send(Packet, State).
+
+send_pubrec(PktIds0, State)
+  when is_list(PktIds0) ->
+    case rabbit_node_monitor:pause_partition_guard() of
+        ok ->
+            %% Classic queues confirm messages unordered.
+            %% Let's sort them here assuming most MQTT clients send with an increasing packet identifier.
+            PktIds = lists:usort(PktIds0),
+            lists:foreach(fun(Id) ->
+                                  send_pubrec(Id, State)
+                          end, PktIds);
+        pausing ->
+            ok
+    end;
+send_pubrec(PktId, State = #state{cfg = #cfg{proto_ver = ProtoVer}}) ->
+    rabbit_global_counters:messages_confirmed(ProtoVer, 1),
+    Packet = #mqtt_packet{fixed = #mqtt_packet_fixed{type = ?PUBREC},
                           variable = #mqtt_packet_publish{packet_id = PktId}},
     send(Packet, State).
 
@@ -1370,7 +1406,12 @@ handle_queue_actions(Actions, #state{} = State0) ->
               deliver_to_client(Msgs, Ack, S);
           ({settled, QName, PktIds}, S = #state{unacked_client_pubs = U0}) ->
               {ConfirmPktIds, U} = rabbit_mqtt_confirms:confirm(PktIds, QName, U0),
-              send_puback(ConfirmPktIds, S),
+              case State0#state.publish_packet_qos of
+                ?QOS_1 ->
+                  send_puback(ConfirmPktIds, S);
+                ?QOS_2 ->
+                  send_pubrec(ConfirmPktIds, S)
+              end,
               S#state{unacked_client_pubs = U};
           ({rejected, _QName, PktIds}, S = #state{unacked_client_pubs = U0}) ->
               %% Negative acks are supported in MQTT v5 only.

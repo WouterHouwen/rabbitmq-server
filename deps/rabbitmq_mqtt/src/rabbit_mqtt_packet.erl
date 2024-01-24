@@ -42,6 +42,8 @@ reset_state() -> authenticated.
     {error, any()}.
 parse(<<>>, authenticated) ->
     {more, fun(Bin) -> parse(Bin, authenticated) end};
+parse(<<?PUBREL:4, 0:4, Rest/binary>>, authenticated) ->
+    parse_remaining_len(Rest, #mqtt_packet_fixed{type = ?PUBREL});
 parse(<<MessageType:4, Dup:1, QoS:2, Retain:1, Rest/binary>>, authenticated) ->
     parse_remaining_len(Rest, #mqtt_packet_fixed{ type   = MessageType,
                                                   dup    = int_to_bool(Dup),
@@ -88,6 +90,9 @@ parse_packet(Bin, #mqtt_packet_fixed{type = Type,
                                                packet_id = PacketId },
                  Payload, Rest);
         {?PUBACK, <<PacketBin:Length/binary, Rest/binary>>} ->
+            <<PacketId:16/big>> = PacketBin,
+            wrap(Fixed, #mqtt_packet_publish { packet_id = PacketId }, Rest);
+       {?PUBREL, <<PacketBin:Length/binary, Rest/binary>>} ->
             <<PacketId:16/big>> = PacketBin,
             wrap(Fixed, #mqtt_packet_publish { packet_id = PacketId }, Rest);
         {Subs, <<PacketBin:Length/binary, Rest/binary>>}
@@ -241,6 +246,18 @@ serialise_variable(#mqtt_packet_fixed   { type       = ?PUBLISH,
     serialise_fixed(Fixed, <<TopicBin/binary, PacketIdBin/binary>>, Payload);
 
 serialise_variable(#mqtt_packet_fixed   { type       = ?PUBACK } = Fixed,
+                   #mqtt_packet_publish { packet_id = PacketId },
+                   PayloadBin, _Vsn) ->
+    PacketIdBin = <<PacketId:16/big>>,
+    serialise_fixed(Fixed, PacketIdBin, PayloadBin);
+
+serialise_variable(#mqtt_packet_fixed   { type       = ?PUBREC } = Fixed,
+                   #mqtt_packet_publish { packet_id = PacketId },
+                   PayloadBin, _Vsn) ->
+    PacketIdBin = <<PacketId:16/big>>,
+    serialise_fixed(Fixed, PacketIdBin, PayloadBin);
+
+serialise_variable(#mqtt_packet_fixed   { type       = ?PUBCOMP } = Fixed,
                    #mqtt_packet_publish { packet_id = PacketId },
                    PayloadBin, _Vsn) ->
     PacketIdBin = <<PacketId:16/big>>,
